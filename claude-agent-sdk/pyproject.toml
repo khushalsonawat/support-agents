@@ -1,0 +1,35 @@
+[project]
+name = "support-agent-claude-agent-sdk"
+version = "0.1.0"
+description = "A customer-support agent service built on the Claude Agent SDK, with a stand-in orders service."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "claude-agent-sdk==0.2.174",
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.0",
+    "httpx==0.28.1",
+    "psycopg[binary,pool]==3.2.6",
+]
+
+[project.optional-dependencies]
+# Tracing and metrics are off unless OTEL_EXPORTER_OTLP_ENDPOINT is set and these are installed.
+otel = [
+    "opentelemetry-sdk==1.30.0",
+    "opentelemetry-exporter-otlp-proto-http==1.30.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.25.3",
+    # A local PostgreSQL for the tests when TEST_DATABASE_URL is not set.
+    "pgserver==0.1.4",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

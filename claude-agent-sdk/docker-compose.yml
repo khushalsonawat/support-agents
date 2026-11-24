@@ -1,0 +1,77 @@
+# Local run: PostgreSQL, the one-off migration and seed steps, the stand-in orders service and
+# the agent. Copy .env.example to .env and fill it in first.
+#
+#   docker compose up --build
+#   curl -s localhost:8000/chat -H "Authorization: Bearer $AGENT_API_TOKEN" \
+#        -H 'content-type: application/json' \
+#        -d '{"customer_id": "C001", "message": "Where is my order A1001?"}'
+
+x-app: &app
+  build: .
+  read_only: true
+  tmpfs: ["/tmp"]
+  env_file: .env
+
+services:
+  postgres:
+    image: postgres:16.6-bookworm
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD}
+      ORDERS_DB_PASSWORD: ${ORDERS_DB_PASSWORD}
+    volumes:
+      - ./docker/postgres-init.sh:/docker-entrypoint-initdb.d/10-databases.sh:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Over TCP: during first start-up the image runs a temporary server on the socket only,
+      # before the two databases exist, and a socket check would pass too early.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 5s
+      retries: 10
+
+  migrate:
+    <<: *app
+    command: >
+      sh -c "python -m app.db.migrate &&
+             python -m app.db.migrate --dir orders_service/migrations --url-env ORDERS_DATABASE_URL"
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  # Sample data for local runs only. A real shop has no seed.
+  seed:
+    <<: *app
+    command: ["python", "-m", "orders_service.seed"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: "no"
+
+  orders-service:
+    <<: *app
+    environment:
+      DATABASE_URL: ""
+      AGENT_API_TOKEN: ""
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_AUTH_TOKEN: ""
+    command: ["uvicorn", "orders_service.app:app", "--host", "0.0.0.0", "--port", "8001"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 10s
+    depends_on:
+      seed: {condition: service_completed_successfully}
+
+  agent:
+    <<: *app
+    ports: ["8000:8000"]
+    # The agent reaches the shop's data only through the orders service.
+    environment:
+      ORDERS_DATABASE_URL: ""
+      POSTGRES_PASSWORD: ""
+      AGENT_DB_PASSWORD: ""
+      ORDERS_DB_PASSWORD: ""
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      orders-service: {condition: service_healthy}
+
+volumes:
+  pgdata:
