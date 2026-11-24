@@ -225,3 +225,21 @@ async def test_ready_stays_true_when_the_database_is_ahead_of_this_build(clean):
     finally:
         with psycopg.connect(clean["agent"], autocommit=True) as conn:
             conn.execute("DELETE FROM schema_migrations WHERE version = '9999_later'")
+
+
+async def test_a_turn_that_outlived_its_claim_is_409_and_saves_nothing(clean, monkeypatch):
+    from app import conversations
+
+    async with agent_service(clean, FakeRunner(delay=0.3)) as client:
+        first = (await client.post("/chat", json=chat())).json()
+        # Every claim counts as stale at once, so the second message takes over from the first.
+        monkeypatch.setattr(conversations, "STALE_CLAIM_SECONDS", 0)
+        late, newer = await asyncio.gather(
+            client.post("/chat", json=chat(message="late", conversation_id=first["conversation_id"])),
+            _after(0.05, client.post("/chat", json=chat(message="newer", conversation_id=first["conversation_id"]))),
+        )
+        assert late.status_code == 409 and late.json()["error"] == "conversation_busy"
+        assert newer.status_code == 200
+    with psycopg.connect(clean["agent"]) as conn:
+        messages = [r[0] for r in conn.execute("SELECT content FROM messages WHERE role = 'customer' ORDER BY id")]
+    assert messages == ["Where is my order A1001?", "newer"]
