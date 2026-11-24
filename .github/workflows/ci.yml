@@ -1,0 +1,120 @@
+# Tests for every agent in this repository, one folder per framework.
+#
+# A folder with a pyproject.toml is an agent. A pull request tests only the
+# agents whose folder it changes (all of them when it changes this file);
+# the merge queue, a push to main and a manual run test every agent.
+# "CI passed" is the one check the main branch rules require: it passes only
+# when every agent that ran passed, so adding an agent needs no rule change.
+
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A new push to a pull request cancels its older run; queue and main runs finish.
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  agents:
+    name: Find agents to test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      list: ${{ steps.find.outputs.list }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: find
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          all=$(find . -mindepth 2 -maxdepth 2 -name pyproject.toml -not -path './.*' \
+            | cut -d/ -f2 | sort)
+          if [ "$EVENT" = "pull_request" ]; then
+            changed=$(git diff --name-only "$BASE"...HEAD)
+            if echo "$changed" | grep -q '^\.github/'; then
+              picked="$all"
+            else
+              picked=$(for agent in $all; do
+                echo "$changed" | grep -q "^$agent/" && echo "$agent"
+              done || true)
+            fi
+          else
+            picked="$all"
+          fi
+          list=$(printf '%s\n' $picked | jq -Rsc 'split("\n") | map(select(length > 0))')
+          echo "Agents to test: $list"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test ${{ matrix.agent }}
+    needs: agents
+    if: needs.agents.outputs.list != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: ${{ fromJSON(needs.agents.outputs.list) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.agent }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -h 127.0.0.1"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # The tests create and drop their own databases on this server.
+      TEST_DATABASE_URL: postgresql://test:test@127.0.0.1:5432/postgres
+      # Tests never call a model; an empty key makes sure nothing paid can run.
+      ANTHROPIC_API_KEY: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.agent }}/uv.lock
+      - name: Install
+        run: uv sync --frozen --group dev --python 3.12
+      - name: Test
+        run: uv run --frozen pytest -q -p no:cacheprovider
+
+  passed:
+    # The single required check. A skipped test job (no agent changed) passes.
+    name: CI passed
+    needs: [agents, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Results: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "A job did not pass: $result"; exit 1 ;;
+            esac
+          done
