@@ -14,6 +14,7 @@ import logging
 import uuid
 from typing import Any, AsyncIterator
 
+import anyio
 import httpx
 import psycopg
 from fastapi import Depends, FastAPI, Request
@@ -27,7 +28,7 @@ from app.auth import token_matches
 from app.clients.orders_api import OrdersClient
 from app.config import Settings, load_settings
 from app.context import TurnContext
-from app.conversations import ClaimStatus, ConversationStore
+from app.conversations import ClaimLost, ClaimStatus, ConversationStore
 from app.db.migrate import latest_version
 from app.db.session import make_pool
 from app.runner import SYSTEM_PROMPT, AgentRunner, ModelUnavailable, TurnInput
@@ -87,7 +88,10 @@ class Service:
                 row = await (
                     await conn.execute("SELECT max(version) FROM schema_migrations")
                 ).fetchone()
-            database = bool(row) and row[0] == latest_version()
+            applied = row[0] if row else None
+            # A database ahead of this build is ready too: migrations run before the next build
+            # starts, and this build keeps serving until it is replaced.
+            database = applied is not None and applied >= latest_version()
         except (*_DB_ERRORS, psycopg.errors.UndefinedTable):
             database = False
         orders = await self.orders.health()
@@ -116,7 +120,7 @@ class Service:
     ) -> dict[str, Any]:
         try:
             if conversation_id is None:
-                conversation_id = await self.conversations.create_claimed(customer_id)
+                conversation_id, started_at = await self.conversations.create_claimed(customer_id)
                 handed_off = False
             else:
                 claim = await self.conversations.claim(conversation_id, customer_id)
@@ -127,6 +131,7 @@ class Service:
                         409, "conversation_busy", "a message in this conversation is still being answered"
                     )
                 handed_off = claim.handed_off
+                started_at = claim.started_at
         except _DB_ERRORS:
             raise ApiError(503, "not_ready", "the service's database is not available") from None
 
@@ -136,13 +141,21 @@ class Service:
                 reply = HANDED_OFF_REPLY
             else:
                 reply = await self._run_agent(ctx, message)
-            await self.conversations.save_turn(
-                conversation_id, customer_id, message, reply, ctx.ticket
-            )
+            try:
+                await self.conversations.save_turn(
+                    conversation_id, started_at, customer_id, message, reply, ctx.ticket
+                )
+            except ClaimLost:
+                raise ApiError(
+                    409, "conversation_busy",
+                    "a newer message in this conversation is being answered; this one was not saved",
+                ) from None
+            except _DB_ERRORS:
+                raise ApiError(503, "not_ready", "the service's database is not available") from None
         except BaseException:
-            # Every failure frees the conversation at once.
+            # Every failure frees the conversation at once, unless a newer turn holds it.
             with contextlib.suppress(Exception):
-                await self.conversations.release(conversation_id)
+                await self.conversations.release(conversation_id, started_at)
             raise
         if ctx.ticket is not None:
             notify_helpdesk(customer_id, conversation_id, ctx.ticket)
@@ -155,6 +168,24 @@ class Service:
         }
 
     async def _run_agent(self, ctx: TurnContext, message: str) -> str:
+        # The cut covers the history reads as well as the model, so slow reads cannot push the
+        # turn past its claim. It is an anyio deadline rather than asyncio.timeout because the
+        # SDK closes the CLI inside an anyio shield, which holds off only anyio cancellation: an
+        # asyncio deadline landing while the client closes stops the close before it terminates
+        # the CLI, and leaves that process running. The close is bounded by the SDK (about 20
+        # seconds at worst), so a cut turn can answer that much after TURN_SECONDS.
+        try:
+            with anyio.fail_after(TURN_SECONDS):
+                turn = await self._turn_input(ctx, message)
+                with observability.span("agent turn", conversation_id=str(ctx.conversation_id)):
+                    return await self.runner.run_turn(turn)
+        except TimeoutError:
+            raise ApiError(504, "turn_timeout", "the answer took too long; send the message again") from None
+        except ModelUnavailable as exc:
+            observability.log(logger, logging.WARNING, "model_unavailable", detail=str(exc))
+            raise ApiError(503, "model_unavailable", "the model is not available right now") from None
+
+    async def _turn_input(self, ctx: TurnContext, message: str) -> TurnInput:
         try:
             limit = self.settings.history_max_messages
             history = await self.conversations.history(ctx.conversation_id, limit)
@@ -163,22 +194,13 @@ class Service:
             )
         except _DB_ERRORS:
             raise ApiError(503, "not_ready", "the service's database is not available") from None
-        turn = TurnInput(
+        return TurnInput(
             system_prompt=SYSTEM_PROMPT,
             history=history,
             history_truncated=truncated,
             message=message,
             tools=build_tools(ctx, self.orders),
         )
-        try:
-            async with asyncio.timeout(TURN_SECONDS):
-                with observability.span("agent turn", conversation_id=str(ctx.conversation_id)):
-                    return await self.runner.run_turn(turn)
-        except TimeoutError:
-            raise ApiError(504, "turn_timeout", "the answer took too long; send the message again") from None
-        except ModelUnavailable as exc:
-            observability.log(logger, logging.WARNING, "model_unavailable", detail=str(exc))
-            raise ApiError(503, "model_unavailable", "the model is not available right now") from None
 
 
 def create_app(
@@ -214,24 +236,38 @@ def create_app(
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):
-        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-        token = observability.request_id_var.set(request_id[:64])
-        with observability.timed() as took:
-            response = await call_next(request)
-        response.headers["X-Request-Id"] = request_id[:64]
-        observability.log(
-            logger,
-            logging.INFO,
-            "request",
-            method=request.method,
-            path=request.url.path,
-            status=response.status_code,
-            seconds=took["seconds"],
-        )
-        observability.count("requests", path=request.url.path, status=response.status_code)
-        observability.count("request_seconds", took["seconds"], path=request.url.path)
-        observability.request_id_var.reset(token)
-        return response
+        request_id = (request.headers.get("X-Request-Id") or str(uuid.uuid4()))[:64]
+        token = observability.request_id_var.set(request_id)
+        status: int | None = None
+        took = {"seconds": 0.0}
+        # In a `finally`, so every request gets its log line and count, whatever happened.
+        try:
+            with observability.timed() as took:
+                try:
+                    response = await call_next(request)
+                except Exception:
+                    # An error no handler answered still gets the API's JSON shape. It is caught
+                    # here, inside the log line, so the line carries the status the caller got.
+                    logger.exception("unhandled_error")
+                    response = _error(
+                        500, "internal_error", "something went wrong; the request ID is in the logs"
+                    )
+            status = response.status_code
+            response.headers["X-Request-Id"] = request_id
+            return response
+        finally:
+            observability.log(
+                logger,
+                logging.INFO,
+                "request",
+                method=request.method,
+                path=request.url.path,
+                status=status,
+                seconds=took["seconds"],
+            )
+            observability.count("requests", path=request.url.path, status=status)
+            observability.count("request_seconds", took["seconds"], path=request.url.path)
+            observability.request_id_var.reset(token)
 
     @app.exception_handler(ApiError)
     async def api_error(_: Request, exc: ApiError) -> JSONResponse:

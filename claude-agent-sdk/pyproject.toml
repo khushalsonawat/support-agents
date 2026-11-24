@@ -5,6 +5,8 @@ description = "A customer-support agent service built on the Claude Agent SDK, w
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "claude-agent-sdk==0.2.174",
+    # The turn cut uses an anyio deadline, which the SDK's shielded close honours.
+    "anyio==4.16.0",
     "fastapi==0.115.12",
     "uvicorn[standard]==0.34.0",
     "httpx==0.28.1",

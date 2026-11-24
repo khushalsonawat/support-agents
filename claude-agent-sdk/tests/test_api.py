@@ -1,11 +1,13 @@
 """The /chat API end to end, with a fake model and the real orders service in-process."""
 
 import asyncio
+import json
 
 import psycopg
 import pytest
 
 from app import main
+from app.conversations import ConversationStore
 from app.runner import ModelUnavailable
 from tests.conftest import FakeRunner, agent_service
 
@@ -163,3 +165,63 @@ async def test_ready_is_false_when_the_orders_service_is_down(clean):
     async with running(app) as client:
         ready = await client.get("/ready")
     assert ready.status_code == 503 and ready.json() == {"database": True, "orders_service": False}
+
+
+def request_lines(captured: str) -> list[dict]:
+    lines = [json.loads(line) for line in captured.splitlines() if line.startswith("{")]
+    return [line for line in lines if line["event"] == "request"]
+
+
+async def test_the_history_reads_are_inside_the_turn_cut(clean, monkeypatch):
+    async def slow_history(self, conversation_id, limit):
+        await asyncio.sleep(2)
+        return []
+
+    monkeypatch.setattr(main, "TURN_SECONDS", 0.2)
+    async with agent_service(clean, FakeRunner()) as client:
+        first = (await client.post("/chat", json=chat())).json()
+        monkeypatch.setattr(ConversationStore, "history", slow_history)
+        cut = await client.post("/chat", json=chat(message="again", conversation_id=first["conversation_id"]))
+        assert cut.status_code == 504 and cut.json()["error"] == "turn_timeout"
+
+
+async def test_a_database_failure_at_save_is_503_and_logged(clean, monkeypatch, capsys):
+    async def failing_save(self, *args, **kwargs):
+        raise psycopg.OperationalError("connection lost")
+
+    async with agent_service(clean, FakeRunner()) as client:
+        first = (await client.post("/chat", json=chat())).json()
+        monkeypatch.setattr(ConversationStore, "save_turn", failing_save)
+        failed = await client.post("/chat", json=chat(message="again", conversation_id=first["conversation_id"]))
+    assert failed.status_code == 503 and failed.json()["error"] == "not_ready"
+    assert [line["status"] for line in request_lines(capsys.readouterr().out)] == [200, 503]
+
+
+async def test_an_unexpected_error_is_a_json_500_and_logged(clean, monkeypatch, capsys):
+    async def broken_save(self, *args, **kwargs):
+        raise RuntimeError("a bug")
+
+    async with agent_service(clean, FakeRunner()) as client:
+        first = (await client.post("/chat", json=chat())).json()
+        monkeypatch.setattr(ConversationStore, "save_turn", broken_save)
+        failed = await client.post("/chat", json=chat(message="again", conversation_id=first["conversation_id"]))
+        assert failed.status_code == 500 and failed.json()["error"] == "internal_error"
+        assert failed.headers["X-Request-Id"]
+        monkeypatch.undo()
+        # The failed turn freed the conversation.
+        after = await client.post("/chat", json=chat(message="third", conversation_id=first["conversation_id"]))
+        assert after.status_code == 200
+    assert [line["status"] for line in request_lines(capsys.readouterr().out)] == [200, 500, 200]
+
+
+async def test_ready_stays_true_when_the_database_is_ahead_of_this_build(clean):
+    # The README's order is migrate, then start: a newer migration lands while this build runs.
+    with psycopg.connect(clean["agent"], autocommit=True) as conn:
+        conn.execute("INSERT INTO schema_migrations (version) VALUES ('9999_later')")
+    try:
+        async with agent_service(clean, FakeRunner()) as client:
+            ready = await client.get("/ready")
+        assert ready.status_code == 200 and ready.json()["database"] is True
+    finally:
+        with psycopg.connect(clean["agent"], autocommit=True) as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE version = '9999_later'")

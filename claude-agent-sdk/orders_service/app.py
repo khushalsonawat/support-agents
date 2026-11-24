@@ -4,7 +4,8 @@
 
 Every call carries the agent's service token and `X-Customer-Id`. An order of another customer
 is answered exactly like an order that does not exist, so nothing leaks. Starting a return
-honours `Idempotency-Key` and allows one open return per order.
+honours `Idempotency-Key` (a started return is answered again; a refusal is not kept) and allows
+one open return per order.
 """
 
 from __future__ import annotations
@@ -178,7 +179,9 @@ def create_app(conninfo: str | None = None, token: str | None = None) -> FastAPI
                             )
                         ).fetchone()
                         status, payload = 201, _return(row)
-                if idempotency_key:
+                # Only a started return is kept under the key. A refusal depends on the order's
+                # state at the time, so a retry with the same key is judged again.
+                if idempotency_key and status == 201:
                     await conn.execute(
                         "INSERT INTO idempotency_keys (customer_id, key, status_code, response)"
                         " VALUES (%s, %s, %s, %s)",

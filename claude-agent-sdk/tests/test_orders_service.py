@@ -80,3 +80,18 @@ async def test_sql_in_an_order_id_is_only_a_value(orders, clean):
 async def test_the_policy_comes_from_the_shop(orders):
     text = (await orders.get("/policy", headers=as_customer("C001"))).json()["text"]
     assert text.startswith("Delivered items can be returned within 30 days")
+
+
+async def test_a_refused_return_is_judged_again_when_its_key_is_retried(orders, clean):
+    first = await orders.post("/orders/A1003/returns", json={"reason": "leaks"}, headers={**as_customer("C001"), "Idempotency-Key": "a"})
+    assert first.status_code == 201
+    headers = {**as_customer("C001"), "Idempotency-Key": "b"}
+    refused = await orders.post("/orders/A1003/returns", json={"reason": "still leaks"}, headers=headers)
+    assert refused.status_code == 409
+    # The cause of the refusal goes away: the first return is closed.
+    with psycopg.connect(clean["orders"], autocommit=True) as conn:
+        conn.execute("UPDATE returns SET status = 'rejected' WHERE order_id = 'A1003'")
+    retried = await orders.post("/orders/A1003/returns", json={"reason": "still leaks"}, headers=headers)
+    assert retried.status_code == 201 and retried.json()["reason"] == "still leaks"
+    again = await orders.post("/orders/A1003/returns", json={"reason": "still leaks"}, headers=headers)
+    assert again.status_code == 201 and again.json() == retried.json()

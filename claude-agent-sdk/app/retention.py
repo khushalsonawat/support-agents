@@ -14,6 +14,8 @@ import sys
 
 import psycopg
 
+from app.config import ConfigError, _positive_int
+
 
 def expire(conninfo: str, days: int) -> int:
     with psycopg.connect(conninfo) as conn:
@@ -42,7 +44,13 @@ def main(argv: list[str] | None = None) -> int:
         print("DATABASE_URL is required", file=sys.stderr)
         return 2
     if args.command == "expire":
-        days = int(os.environ.get("RETENTION_DAYS") or 90)
+        # The same check the service makes at start: a period of zero or less would put the
+        # cut-off at now or later and remove every conversation.
+        try:
+            days = _positive_int(os.environ, "RETENTION_DAYS", 90)
+        except ConfigError as exc:
+            print(exc, file=sys.stderr)
+            return 2
         print(f"removed {expire(conninfo, days)} conversation(s) older than {days} days")
     else:
         print(f"removed {delete_customer(conninfo, args.customer)} conversation(s)")

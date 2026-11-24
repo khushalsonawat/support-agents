@@ -70,14 +70,15 @@ Response:
 | 400 | `invalid_request` | bad JSON, an empty message, or a missing `customer_id` |
 | 401 | `unauthorized` | no token, or a wrong one |
 | 404 | `conversation_not_found` | an unknown conversation, or another customer's |
-| 409 | `conversation_busy` | a message in this conversation is still being answered |
+| 409 | `conversation_busy` | a message in this conversation is still being answered, or a newer one took over while this one ran past its claim (nothing was saved) |
 | 413 | `message_too_long` | more than 4,000 characters |
 | 429 | `too_many_turns` | more than `MAX_CONCURRENT_TURNS` turns at once; see `Retry-After` |
+| 500 | `internal_error` | a fault in the service; its log line carries the request ID |
 | 503 | `model_unavailable` | the model provider failed |
 | 503 | `not_ready` | the agent's database is down |
-| 504 | `turn_timeout` | the turn took more than 55 seconds; nothing was saved, so send the message again |
+| 504 | `turn_timeout` | the turn took more than 55 seconds; nothing was saved, so send the message again. Closing the cut CLI can delay this answer by up to about 20 seconds |
 
-`GET /health` says the process is alive. `GET /ready` says the database (with migrations applied) and the orders service answer; point a load balancer at this one.
+`GET /health` says the process is alive. `GET /ready` says the database (with this build's migrations applied, or newer ones) and the orders service answer; point a load balancer at this one.
 
 ## Settings
 
@@ -135,6 +136,7 @@ uv run pytest
 
 - The database tests use `TEST_DATABASE_URL` if it is set. If not, they start a local PostgreSQL with `pgserver`.
 - The model is replaced by a fake that calls chosen tools (`tests/conftest.py`), so the tests make no paid model calls.
+- `tests/test_real_model.py` runs the real CLI and model: the tools the CLI offers, one conversation, and a turn cut at the deadline. Each run is paid, so it is skipped unless `SUPPORT_AGENT_REAL_MODEL_TESTS=1` and `ANTHROPIC_API_KEY` are both set.
 
 ## Why each framework has its own full copy
 
